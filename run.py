@@ -8,6 +8,15 @@ import torch
 import torch.utils.serialization
 import PIL
 import PIL.Image
+from decimal import Decimal
+from datetime import datetime
+import time
+import os
+import shutil
+
+# If the user has not installed ffmpeg
+import imageio
+imageio.plugins.ffmpeg.download()
 
 from moviepy.video.io.ffmpeg_reader import FFMPEG_VideoReader
 from moviepy.video.io.ffmpeg_writer import FFMPEG_VideoWriter
@@ -26,6 +35,7 @@ arguments_strSecond = './images/second.png'
 arguments_strOut = './result.png'
 arguments_strVideo = ''
 arguments_strVideoOut = ''
+arguments_strVideoAudio = ''
 
 for strOption, strArgument in getopt.getopt(sys.argv[1:], '', [ strParameter[2:] + '=' for strParameter in sys.argv[1::2] ])[0]:
 	if strOption == '--model':
@@ -41,10 +51,12 @@ for strOption, strArgument in getopt.getopt(sys.argv[1:], '', [ strParameter[2:]
 		arguments_strOut = strArgument # path to where the output should be stored
 
 	elif strOption == '--video':
-		arguments_strVideo = strArgument # path to the video
+		arguments_strVideo = strArgument # path to the input video
 
 	elif strOption == '--video-out':
-		arguments_strVideoOut = strArgument # path to the video
+		arguments_strVideoOut = strArgument # path to the output video
+	elif strOption == '--video-audio':
+		arguments_strVideoAudio = strArgument # path to the video's audio
 	# end
 # end
 
@@ -152,20 +164,26 @@ class Network(torch.nn.Module):
 		variableDeconv5 = self.moduleDeconv5(variablePool5)
 		variableUpsample5 = self.moduleUpsample5(variableDeconv5)
 
-		variableDeconv4 = self.moduleDeconv4(variableUpsample5 + variableConv5)
+		variableCombine = variableUpsample5 + variableConv5
+
+		variableDeconv4 = self.moduleDeconv4(variableCombine)
 		variableUpsample4 = self.moduleUpsample4(variableDeconv4)
 
-		variableDeconv3 = self.moduleDeconv3(variableUpsample4 + variableConv4)
+		variableCombine = variableUpsample4 + variableConv4
+
+		variableDeconv3 = self.moduleDeconv3(variableCombine)
 		variableUpsample3 = self.moduleUpsample3(variableDeconv3)
 
-		variableDeconv2 = self.moduleDeconv2(variableUpsample3 + variableConv3)
+		variableCombine = variableUpsample3 + variableConv3
+
+		variableDeconv2 = self.moduleDeconv2(variableCombine)
 		variableUpsample2 = self.moduleUpsample2(variableDeconv2)
 
 		variableCombine = variableUpsample2 + variableConv2
 
 		variableDot1 = SeparableConvolution()(self.modulePad(variableInput1), self.moduleVertical1(variableCombine), self.moduleHorizontal1(variableCombine))
 		variableDot2 = SeparableConvolution()(self.modulePad(variableInput2), self.moduleVertical2(variableCombine), self.moduleHorizontal2(variableCombine))
-
+		
 		return variableDot1 + variableDot2
 	# end
 # end
@@ -181,15 +199,15 @@ def process(tensorInputFirst, tensorInputSecond, tensorOutput):
 	intWidth = tensorInputFirst.size(2)
 	intHeight = tensorInputFirst.size(1)
 
-	assert(intWidth <= 1280) # while our approach works with larger images, we do not recommend it unless you are aware of the implications
-	assert(intHeight <= 720) # while our approach works with larger images, we do not recommend it unless you are aware of the implications
+	# assert(intWidth <= 1280) # while our approach works with larger images, we do not recommend it unless you are aware of the implications
+	# assert(intHeight <= 720) # while our approach works with larger images, we do not recommend it unless you are aware of the implications
 
 	intPaddingLeft = int(math.floor(51 / 2.0))
 	intPaddingTop = int(math.floor(51 / 2.0))
 	intPaddingRight = int(math.floor(51 / 2.0))
 	intPaddingBottom = int(math.floor(51 / 2.0))
-	modulePaddingInput = torch.nn.Module()
-	modulePaddingOutput = torch.nn.Module()
+	modulePaddingInput = torch.nn.Sequential()
+	modulePaddingOutput = torch.nn.Sequential()
 
 	if True:
 		intPaddingWidth = intPaddingLeft + intWidth + intPaddingRight
@@ -235,13 +253,88 @@ def process(tensorInputFirst, tensorInputSecond, tensorOutput):
 
 tensorOutput = torch.FloatTensor()
 
+def printProgressBar (iteration, total, prefix = '', suffix = '', decimals = 2, length = 50, fill = '#', emptyFill = '='):
+	"""
+	Call in a loop to create terminal progress bar
+	@params:
+		iteration   - Required  : current iteration (Int)
+		total       - Required  : total iterations (Int)
+		prefix      - Optional  : prefix string (Str)
+		suffix      - Optional  : suffix string (Str)
+		decimals    - Optional  : positive number of decimals in percent complete (Int)
+		length      - Optional  : character length of bar (Int)
+		fill        - Optional  : bar fill character (Str)
+	"""
+	percent = ("{0:." + str(decimals) + "f}").format(100 * (iteration / float(total)))
+	filledLength = int(length * iteration // total)
+	bar = fill * filledLength + emptyFill * (length - filledLength)
+	sys.stdout.write('\r%s[%s] %s%%%s' % (prefix, bar, percent, suffix))
+	sys.stdout.flush()
+	# Print New Line on Complete
+	if iteration == total: 
+		print("")
+
 if arguments_strVideo and arguments_strVideoOut:
 	# Process video
+	exists = os.path.exists(arguments_strVideoOut) and os.path.isfile(arguments_strVideoOut)
+	startFrame = 0
+
+	if exists:
+		# Continue from where it left off
+		print("Resuming processing...")
+		
+		print("Moving processed video to temporary storage...")
+		tempDir = "temp"
+		tempDest = tempDir + "/" + os.path.basename(arguments_strVideoOut)
+		if os.path.exists(tempDir):
+			shutil.rmtree(tempDir)
+		os.makedirs(tempDir)
+		
+		shutil.move(arguments_strVideoOut, tempDest)
+		
+		readerCont = FFMPEG_VideoReader(tempDest, False)
+		totalFramesCont = readerCont.nframes
+		if totalFramesCont % 2 == 0:
+			# Even numbers: Ended on interpolated frame
+			# startFrame = number of last original frame
+			# This means that it will skip this frame
+			startFrame = totalFramesCont / 2
+		else:
+			# Odd numbers: Ended on original frame
+			# startFrame = number of second last original frame
+			# This means that it will move on to the current frame
+			startFrame = (totalFramesCont - 1) / 2
+
 	reader = FFMPEG_VideoReader(arguments_strVideo, False)
-	writer = FFMPEG_VideoWriter(arguments_strVideoOut, reader.size, reader.fps*2)
-	reader.initialize()
+	if arguments_strVideoAudio:
+		writer = FFMPEG_VideoWriter(arguments_strVideoOut, reader.size, reader.fps*2, audiofile=arguments_strVideoAudio)
+
+	else: 
+		writer = FFMPEG_VideoWriter(arguments_strVideoOut, reader.size, reader.fps*2)
+
+	if exists:
+		# Write frames that were already completed
+		print("Re-writing processed frames...")
+		printProgressBar(0, readerCont.nframes)
+		for x in range(0, readerCont.nframes):
+			writer.write_frame(readerCont.read_frame())
+			printProgressBar(x + 1, readerCont.nframes)
+
+		reader.skip_frames(startFrame)
+		
+		readerCont.close()
+		
+		print("Deleting temporary file(s)...")
+		shutil.rmtree(tempDir)
+		
+		print("Processing resumed!")
+		print("")
+		
+	totalFrames = reader.nframes
 	nextFrame = reader.read_frame()
-	for x in range(0, reader.nframes):
+	startedTime = datetime.now()
+	for x in range(startFrame, reader.nframes):
+		start = datetime.now()
 		firstFrame = nextFrame
 		nextFrame = reader.read_frame()
 		tensorInputFirst = torch.FloatTensor(numpy.rollaxis(firstFrame[:,:,::-1], 2, 0) / 255.0)
@@ -249,9 +342,34 @@ if arguments_strVideo and arguments_strVideoOut:
 		process(tensorInputFirst, tensorInputSecond, tensorOutput)
 		writer.write_frame(firstFrame)
 		writer.write_frame((numpy.rollaxis(tensorOutput.clamp(0.0, 1.0).numpy(), 0, 3)[:,:,::-1] * 255.0).astype(numpy.uint8))
+		
+		# Calculate and display stats
+		countDone = x + 1
+		percentDone = round(Decimal((float(countDone) / float(totalFrames)) * 100), 2)
+		print("Frames done: " + str(countDone) + "/" + str(totalFrames) + " (" + str(percentDone) + "%)")
+		secondsDone = round(Decimal((float(countDone) / float(reader.fps))), 2)
+		print("Seconds of video done: " + str(secondsDone))
+		timeTaken = datetime.now() - start
+		fps = round(Decimal(float(float(1)/timeTaken.total_seconds())), 3)
+		print("Frames per second: " + str(fps) + " f/s")
+		spf = round(Decimal(timeTaken.total_seconds()), 3)
+		print("Seconds per frame: " + str(spf) + " s/f")
+		timeElapsed = datetime.now() - startedTime
+		m, s = divmod(timeElapsed.total_seconds(), 60)
+		h, m = divmod(m, 60)
+		timeElapsedSeconds = "%dH:%02dM:%02dS" % (h, m, s)
+		print("Elapsed time: " + timeElapsedSeconds)
+		timeLeft = float(timeTaken.total_seconds() * float(totalFrames - countDone))
+		m, s = divmod(timeLeft, 60)
+		h, m = divmod(m, 60)
+		timeLeftSeconds = "%dH:%02dM:%02dS" % (h, m, s)
+		print("Estimated time remaining: " + timeLeftSeconds)
+		print("")
 	#end
 	writer.write_frame(nextFrame)
 	writer.close()
+	reader.close()
+	print("Done!")
 else:
 	# Process image
 	tensorInputFirst = torch.FloatTensor(numpy.rollaxis(numpy.asarray(PIL.Image.open(arguments_strFirst))[:,:,::-1], 2, 0).astype(numpy.float32) / 255.0)
